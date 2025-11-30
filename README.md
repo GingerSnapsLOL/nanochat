@@ -97,6 +97,19 @@ And a bit more about computing environments that will run nanochat:
 
 nanochat can be run on CPU or on MPS (if you're on Macbook), and will automatically try to detect what device is best to run on. You're not going to get too far without GPUs, but at least you'll be able to run the code paths and maybe train a tiny LLM with some patience. For an example of how to make all the run commands much smaller (feel free to tune!), you can refer to [dev/runcpu.sh](dev/runcpu.sh) file. You'll see that I'm essentially restricting all scripts to train smaller models, to run for shorter number of iterations, etc. This functionality is new, slightly gnarly (touched a lot of code), and was merged in this [CPU|MPS PR](https://github.com/karpathy/nanochat/pull/88) on Oct 21, 2025.
 
+## Single GPU Training
+
+For single GPU setups, use [train_1gpu.sh](train_1gpu.sh). This script automatically detects and skips completed setup steps (uv, Rust, tokenizer, dataset downloads) and trains a full pipeline on one GPU. It supports both GPT and Alcoholic model architectures via the `--model_type` flag in training scripts.
+
+## Model Architectures
+
+nanochat supports two model architectures:
+
+- **GPT**: Default model with functional RMSNorm (no learnable params), ReLU² activation, RoPE base=10K. Optimized for simplicity and efficiency.
+- **Alcoholic**: Alternative architecture with learnable RMSNorm, SwiGLU activation, extended RoPE base=1M, and optional QK normalization. May offer improved performance at the cost of additional parameters.
+
+Both models use the same training pipeline and can be selected via `--model_type gpt` or `--model_type alcoholic` in `base_train.py`, `mid_train.py`, and `chat_sft.py`.
+
 ## Customization
 
 To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into midtraining and SFT stages.
