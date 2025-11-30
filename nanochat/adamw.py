@@ -2,6 +2,7 @@
 Borrowed from modded-nanogpt. By Keller, @vagrawal, et al.
 Not a general optimizer! But works for our specific use.
 """
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -74,3 +75,60 @@ class DistAdamW(torch.optim.Optimizer):
                 idx += 1
                 all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
+
+
+
+
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas=(0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("SimpleAdamW does not support sparse gradients")
+
+                state = self.state[p]
+                # state init
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                t = state["step"]
+                # decoupled weight decay
+                if wd != 0.0:
+                    p.mul_(1 - lr * wd)
+                # update moments
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                # bias correction
+                bias_correction1 = 1 - beta1 ** t
+                bias_correction2 = 1 - beta2 ** t
+                # compute step
+                denom = exp_avg_sq.sqrt().add_(eps)
+                step_size = lr * torch.sqrt(bias_correction2) / bias_correction1
+
+                p.addcdiv_(exp_avg, denom, value=-step_size)

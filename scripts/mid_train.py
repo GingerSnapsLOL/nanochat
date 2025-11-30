@@ -73,6 +73,15 @@ if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
+# Get model_type from metadata (saved during base training) or infer from config
+model_type = meta.get("model_type", None)
+if model_type is None:
+    # Infer from config: alcoholic has extra fields
+    if hasattr(model.config, "rope_theta") or hasattr(model.config, "intermediate_size"):
+        model_type = "alcoholic"
+    else:
+        model_type = "gpt"
+print0(f"Model type: {model_type}")
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -207,8 +216,17 @@ while True:
 
     # save checkpoint at the end of the run (only on master process)
     if master_process and last_step and not dry_run:
-        output_dirname = f"d{depth}" # e.g. d12
+        output_dirname = f"{model_type}_d{depth}" # e.g. gpt_d12 or alcoholic_d12
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+        # Build model_config from model's config (handles both GPT and Alcoholic)
+        model_config_dict = model.config.__dict__ if hasattr(model.config, "__dict__") else {
+            "sequence_len": max_seq_len,
+            "vocab_size": tokenizer.get_vocab_size(),
+            "n_layer": depth,
+            "n_head": model.config.n_head,
+            "n_kv_head": model.config.n_kv_head,
+            "n_embd": model.config.n_embd,
+        }
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -217,14 +235,8 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                },
+                "model_type": model_type, # save which model type was used
+                "model_config": model_config_dict,
                 "user_config": user_config, # inputs to the training script
             }
         )

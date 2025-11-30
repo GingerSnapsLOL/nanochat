@@ -4,6 +4,11 @@ Test Engine class. Example run:
 python -m pytest tests/test_engine.py -v
 """
 
+import os
+# Prevent PyTorch from trying to load CUDA libraries if they're not available
+# This allows tests to run on CPU-only systems or systems without CUDA installed
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 import torch
 from nanochat.engine import KVCache
 

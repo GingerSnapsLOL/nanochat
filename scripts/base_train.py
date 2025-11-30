@@ -19,6 +19,7 @@ from contextlib import nullcontext
 import wandb
 import torch
 
+from nanochat.alcoholic import AlcoholicNanoGPT, AlcoholicNanoConfig
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -29,12 +30,16 @@ from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
 
+
+
+
 # -----------------------------------------------------------------------------
 # User settings
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
+model_type = "gpt" # "gpt" or "alcoholic" - which model architecture to use
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
@@ -89,6 +94,7 @@ num_layers = depth
 model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
 num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
+print0(f"Model type: {model_type}")
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
@@ -105,10 +111,47 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
-with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+assert model_type in ["gpt", "alcoholic"], f"model_type must be 'gpt' or 'alcoholic', got '{model_type}'"
+
+if model_type == "gpt":
+    # Standard GPT model
+    model_config_kwargs = dict(
+        sequence_len=max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=num_layers,
+        n_head=num_heads,
+        n_kv_head=num_kv_heads,
+        n_embd=model_dim
+    )
+    with torch.device("meta"):
+        model_config = GPTConfig(**model_config_kwargs)
+        model = GPT(model_config)
+elif model_type == "alcoholic":
+    # Alcoholic model - uses different config structure
+    # For alcoholic, we need to map the depth-based dimensions appropriately
+    # Alcoholic uses fixed intermediate_size ratio, so we adjust accordingly
+    alcoholic_model_dim = model_dim
+    alcoholic_num_heads = num_heads
+    alcoholic_num_kv_heads = max(1, num_kv_heads // 2) if num_kv_heads > 1 else 1  # Alcoholic typically uses fewer KV heads
+    alcoholic_intermediate_size = 4 * alcoholic_model_dim  # Standard 4x ratio
+    
+    model_config_kwargs = dict(
+        sequence_len=max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=num_layers,
+        n_head=alcoholic_num_heads,
+        n_kv_head=alcoholic_num_kv_heads,
+        n_embd=alcoholic_model_dim,
+        intermediate_size=alcoholic_intermediate_size,
+        rope_theta=1_000_000.0,
+        qk_norm=True,
+        norm_type="rmsnorm",
+        mlp_type="swiglu",
+        dropout=0.0,
+    )
+    with torch.device("meta"):
+        model_config = AlcoholicNanoConfig(**model_config_kwargs)
+        model = AlcoholicNanoGPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
 orig_model = model # original, uncompiled model, for saving raw model state_dict
@@ -239,7 +282,7 @@ for step in range(num_iterations + 1):
 
     # save checkpoint at the end of the run (only on master process)
     if master_process and last_step:
-        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+        output_dirname = model_tag if model_tag else f"{model_type}_d{depth}" # e.g. gpt_d12 or alcoholic_d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
@@ -249,6 +292,7 @@ for step in range(num_iterations + 1):
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
+                "model_type": model_type, # save which model type was used
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,

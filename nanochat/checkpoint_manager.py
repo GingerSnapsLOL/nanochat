@@ -10,6 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.alcoholic import AlcoholicNanoGPT, AlcoholicNanoConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -74,10 +75,28 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    
+    # Detect model type from metadata (saved in base_train.py) or infer from config
+    model_type = meta_data.get("model_type", None)
+    if model_type is None:
+        # Infer from config: alcoholic has extra fields like rope_theta, intermediate_size
+        if "rope_theta" in model_config_kwargs or "intermediate_size" in model_config_kwargs:
+            model_type = "alcoholic"
+        else:
+            model_type = "gpt"
+    
+    log0(f"Building {model_type} model with config: {model_config_kwargs}")
+    
+    if model_type == "gpt":
+        model_config = GPTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPT(model_config)
+    elif model_type == "alcoholic":
+        model_config = AlcoholicNanoConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = AlcoholicNanoGPT(model_config)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
@@ -99,10 +118,11 @@ def find_largest_model(checkpoint_dir):
     model_tags = [f for f in os.listdir(checkpoint_dir) if os.path.isdir(os.path.join(checkpoint_dir, f))]
     if not model_tags:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    # 1) normally all model tags are of the form d<number>, try that first:
+    # 1) normally all model tags are of the form [model_type_]d<number> (e.g. d12, gpt_d12, alcoholic_d12), try that first:
     candidates = []
     for model_tag in model_tags:
-        match = re.match(r"d(\d+)", model_tag)
+        # Match both old format (d12) and new format (gpt_d12, alcoholic_d12)
+        match = re.match(r"(?:gpt_|alcoholic_)?d(\d+)", model_tag)
         if match:
             model_depth = int(match.group(1))
             candidates.append((model_depth, model_tag))

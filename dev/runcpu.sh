@@ -15,7 +15,7 @@ mkdir -p $NANOCHAT_BASE_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
 uv sync --extra cpu
-source .venv/bin/activate
+# Note: With uv, we use `uv run` instead of activating venv and using `python`
 if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
@@ -24,17 +24,17 @@ source "$HOME/.cargo/env"
 uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 
 # wipe the report
-python -m nanochat.report reset
+uv run -m nanochat.report reset
 
 # train tokenizer on ~1B characters
-python -m nanochat.dataset -n 4
-python -m scripts.tok_train --max_chars=1000000000
-python -m scripts.tok_eval
+uv run -m nanochat.dataset -n 4
+uv run -m scripts.tok_train --max_chars=1000000000
+uv run -m scripts.tok_eval
 
 # train a very small 4 layer model on the CPU
 # each optimization step processes a single sequence of 1024 tokens
 # we only run 50 steps of optimization (bump this to get better results)
-python -m scripts.base_train \
+uv run -m scripts.base_train \
     --depth=4 \
     --max_seq_len=1024 \
     --device_batch_size=1 \
@@ -45,11 +45,11 @@ python -m scripts.base_train \
     --core_metric_max_per_task=12 \
     --sample_every=50 \
     --num_iterations=50
-python -m scripts.base_loss --device_batch_size=1 --split_tokens=4096
-python -m scripts.base_eval --max-per-task=16
+uv run -m scripts.base_loss --device_batch_size=1 --split_tokens=4096
+uv run -m scripts.base_eval --max-per-task=16
 
 # midtraining
-python -m scripts.mid_train \
+uv run -m scripts.mid_train \
     --max_seq_len=1024 \
     --device_batch_size=1 \
     --eval_every=50 \
@@ -58,10 +58,10 @@ python -m scripts.mid_train \
     --num_iterations=100
 # eval results will be terrible, this is just to execute the code paths.
 # note that we lower the execution memory limit to 1MB to avoid warnings on smaller systems
-python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
+uv run -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
 
 # SFT
-python -m scripts.chat_sft \
+uv run -m scripts.chat_sft \
     --device_batch_size=1 \
     --target_examples_per_step=4 \
     --num_iterations=100 \
@@ -69,9 +69,9 @@ python -m scripts.chat_sft \
     --eval_metrics_max_problems=16
 
 # Chat CLI
-# python -m scripts.chat_cli -p "Why is the sky blue?"
+# uv run -m scripts.chat_cli -p "Why is the sky blue?"
 
 # Chat Web
-# python -m scripts.chat_web
+# uv run -m scripts.chat_web
 
-python -m nanochat.report generate
+uv run -m nanochat.report generate

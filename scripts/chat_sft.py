@@ -77,6 +77,15 @@ model, tokenizer, meta = load_model(source, device, phase="train", model_tag=mod
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
+# Get model_type from metadata (saved during base/mid training) or infer from config
+model_type = meta.get("model_type", None)
+if model_type is None:
+    # Infer from config: alcoholic has extra fields
+    if hasattr(model.config, "rope_theta") or hasattr(model.config, "intermediate_size"):
+        model_type = "alcoholic"
+    else:
+        model_type = "gpt"
+print0(f"Model type: {model_type}")
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -251,9 +260,9 @@ for step in range(num_iterations):
 if master_process:
     base_dir = get_base_dir()
     depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
+    model_tag = f"{model_type}_d{depth}" # base the model tag on model type and depth, e.g. gpt_d12 or alcoholic_d12
     checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+    model_config_kwargs = model.config.__dict__ # works for both GPTConfig and AlcoholicNanoConfig
     save_checkpoint(
         checkpoint_dir,
         step,
@@ -262,6 +271,7 @@ if master_process:
         {
             "step": step,
             "val_loss": val_loss,
+            "model_type": model_type, # save which model type was used
             **metrics,
             "model_config": model_config_kwargs,
         }

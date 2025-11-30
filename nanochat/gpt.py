@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
-from nanochat.adamw import DistAdamW
+from nanochat.adamw import DistAdamW, AdamW
 
 @dataclass
 class GPTConfig:
@@ -214,10 +214,24 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # GPT model has exactly 3 parameter groups (no learnable norm params)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        # This assertion is GPT-specific: GPT has no learnable norm parameters
+        # Alcoholic model would have additional norm_in/norm_out parameters
+        all_params = list(self.parameters())
+        accounted_params = matrix_params + embedding_params + lm_head_params
+        if len(all_params) != len(accounted_params):
+            # This should never happen for GPT, but provide helpful error
+            all_param_names = {id(p): name for name, p in self.named_parameters()}
+            accounted_param_ids = {id(p) for p in accounted_params}
+            missing = [all_param_names[id(p)] for p in all_params if id(p) not in accounted_param_ids]
+            raise AssertionError(
+                f"GPT model parameter count mismatch: total={len(all_params)}, accounted={len(accounted_params)}\n"
+                f"Missing parameters: {missing}\n"
+                f"This suggests the model structure changed unexpectedly."
+            )
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
