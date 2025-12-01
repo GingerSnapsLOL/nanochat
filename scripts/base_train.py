@@ -24,7 +24,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -65,6 +65,8 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
+save_every = 500 # save checkpoint every N iterations (0 = disable periodic saves, only save at end)
+continue_training = False # if True, resume from latest checkpoint (auto-detects model_tag if not set)
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -194,6 +196,55 @@ build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size,
 x, y = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
+# Resume from checkpoint if requested
+start_step = 0
+min_val_bpb = float("inf")  # Initialize, will be restored from checkpoint if resuming
+if continue_training:
+    output_dirname = model_tag if model_tag else f"{model_type}_d{depth}"
+    checkpoints_dir = os.path.join(base_dir, "base_checkpoints")
+    checkpoint_dir, resume_step = find_latest_checkpoint(checkpoints_dir, model_tag=output_dirname if model_tag else None)
+    
+    if checkpoint_dir is not None and resume_step is not None:
+        print0(f"🔄 Resuming training from checkpoint: {checkpoint_dir} at step {resume_step}")
+        # Load model state
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_step, device, load_optimizer=True)
+        
+        # Fix torch compile prefix if needed
+        model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+        
+        # Load model weights
+        orig_model.load_state_dict(model_data, strict=True, assign=True)
+        
+        # Load optimizer states
+        if optimizer_data is not None and len(optimizer_data) == len(optimizers):
+            for opt, opt_state in zip(optimizers, optimizer_data):
+                opt.load_state_dict(opt_state)
+            print0("✅ Loaded optimizer states")
+        else:
+            print0("⚠️  Optimizer state not found or mismatched, reinitializing optimizers")
+        
+        # Get the saved step and adjust training
+        start_step = resume_step + 1
+        saved_num_iterations = meta_data.get("user_config", {}).get("num_iterations", num_iterations)
+        
+        # Restore min_val_bpb from checkpoint if available
+        saved_val_bpb = meta_data.get("val_bpb", None)
+        if saved_val_bpb is not None:
+            min_val_bpb = saved_val_bpb
+            print0(f"📊 Restored min validation bpb: {min_val_bpb:.4f}")
+        
+        # If we've already completed training, warn the user
+        if start_step >= num_iterations:
+            print0(f"⚠️  Warning: Checkpoint is at step {resume_step}, but target is {num_iterations}. Training already complete!")
+        else:
+            print0(f"📊 Resuming from step {start_step} (checkpoint was at step {resume_step})")
+            print0(f"   Target: {num_iterations} steps, Remaining: {num_iterations - start_step} steps")
+    else:
+        print0(f"⚠️  --continue specified but no checkpoint found for {output_dirname}")
+        print0("   Starting training from scratch...")
+        continue_training = False
+
+# -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
 # Learning rate scheduler
@@ -216,12 +267,12 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+# If resuming, start from start_step, otherwise start from 0
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -280,8 +331,15 @@ for step in range(num_iterations + 1):
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step:
+    # save checkpoint periodically and at the end (only on master process)
+    should_save = False
+    if master_process:
+        if last_step:
+            should_save = True
+        elif save_every > 0 and step > 0 and step % save_every == 0:
+            should_save = True
+    
+    if should_save:
         output_dirname = model_tag if model_tag else f"{model_type}_d{depth}" # e.g. gpt_d12 or alcoholic_d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         save_checkpoint(
@@ -299,6 +357,7 @@ for step in range(num_iterations + 1):
                 "max_seq_len": max_seq_len,
             }
         )
+        print0(f"✅ Saved checkpoint at step {step:05d}")
 
     if last_step:
         break

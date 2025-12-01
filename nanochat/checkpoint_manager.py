@@ -142,6 +142,31 @@ def find_last_step(checkpoint_dir):
     last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
     return last_step
 
+def find_latest_checkpoint(checkpoints_dir, model_tag=None):
+    """
+    Find the latest checkpoint for a given model tag.
+    Returns (checkpoint_dir, step) or (None, None) if no checkpoint found.
+    """
+    if not os.path.exists(checkpoints_dir):
+        return None, None
+    
+    if model_tag is None:
+        # Try to find the largest model
+        try:
+            model_tag = find_largest_model(checkpoints_dir)
+        except (FileNotFoundError, ValueError):
+            return None, None
+    
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+    if not os.path.exists(checkpoint_dir):
+        return None, None
+    
+    try:
+        step = find_last_step(checkpoint_dir)
+        return checkpoint_dir, step
+    except FileNotFoundError:
+        return None, None
+
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 

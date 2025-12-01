@@ -131,6 +131,8 @@ echo ""
 # - depth: 12 (small), 16 (medium), 20 (large)
 # - device_batch_size: Reduce if OOM (try 16, 8, 4, or 2)
 # - max_seq_len: 2048 is good for most GPUs
+# - save_every: Checkpoint saving interval (500 = save every 500 steps, 0 = only at end)
+# - continue_training: Set to true to resume from latest checkpoint (auto-detects model)
 
 echo "Starting base training on single GPU..."
 uv run -m scripts.base_train \
@@ -138,6 +140,8 @@ uv run -m scripts.base_train \
     --max_seq_len=2048 \
     --device_batch_size=16 \
     --total_batch_size=524288 \
+    --save_every=500 \
+    --continue_training=false \
     --run=$WANDB_RUN
 
 # Evaluate base model
