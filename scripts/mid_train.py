@@ -47,6 +47,8 @@ weight_decay = 0.0
 eval_every = 150 # -1 = disable
 eval_tokens = 20*524288
 total_batch_size = 524288
+save_every = 500 # save checkpoint every N iterations (0 = disable periodic saves, only save at end)
+save_best = True # if True, save checkpoint whenever validation bpb improves
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -197,6 +199,8 @@ while True:
         last_step = bool(last_step_tensor.item())
 
     # once in a while: evaluate the val bpb (all ranks participate)
+    val_bpb = None
+    improved = False
     if eval_every > 0 and (last_step or step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
@@ -204,8 +208,11 @@ while True:
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-        if val_bpb < min_val_bpb:
+        improved = val_bpb < min_val_bpb
+        if improved:
             min_val_bpb = val_bpb
+            if save_best and master_process and not dry_run:
+                print0(f"🎯 New best validation bpb: {min_val_bpb:.4f} - saving best model")
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -213,9 +220,25 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+    else:
+        # Use previous val_bpb if available, otherwise use a placeholder
+        val_bpb = min_val_bpb if min_val_bpb != float("inf") else None
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step and not dry_run:
+    # save checkpoint periodically, on best model, and at the end (only on master process)
+    should_save = False
+    save_reason = ""
+    if master_process and not dry_run:
+        if last_step:
+            should_save = True
+            save_reason = "final"
+        elif save_every > 0 and step > 0 and step % save_every == 0:
+            should_save = True
+            save_reason = "periodic"
+        elif save_best and improved:  # Save when validation improved
+            should_save = True
+            save_reason = "best"
+    
+    if should_save:
         output_dirname = f"{model_type}_d{depth}" # e.g. gpt_d12 or alcoholic_d12
         checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
         # Build model_config from model's config (handles both GPT and Alcoholic)
@@ -227,6 +250,16 @@ while True:
             "n_kv_head": model.config.n_kv_head,
             "n_embd": model.config.n_embd,
         }
+        # For alcoholic models, include additional config fields
+        if model_type == "alcoholic" and hasattr(model.config, "rope_theta"):
+            model_config_dict.update({
+                "rope_theta": model.config.rope_theta,
+                "qk_norm": getattr(model.config, "qk_norm", True),
+                "norm_type": getattr(model.config, "norm_type", "rmsnorm"),
+                "mlp_type": getattr(model.config, "mlp_type", "swiglu"),
+                "intermediate_size": getattr(model.config, "intermediate_size", 4 * model.config.n_embd),
+                "dropout": getattr(model.config, "dropout", 0.0),
+            })
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -234,12 +267,14 @@ while True:
             [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
             {
                 "step": step,
-                "val_bpb": val_bpb, # loss at last step
+                "val_bpb": val_bpb if val_bpb is not None else min_val_bpb, # validation bpb at this step
+                "min_val_bpb": min_val_bpb, # best validation bpb so far
                 "model_type": model_type, # save which model type was used
                 "model_config": model_config_dict,
                 "user_config": user_config, # inputs to the training script
             }
         )
+        print0(f"✅ Saved checkpoint at step {step:05d} ({save_reason})")
 
     if last_step:
         break
