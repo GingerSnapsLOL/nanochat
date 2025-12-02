@@ -128,24 +128,36 @@ class DistMuon(torch.optim.Optimizer):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
 
-        # Ensure all grads exist
-        assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
+        # Ensure all grads exist (skip parameters without gradients, which can happen when resuming)
+        params_with_grads = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    params_with_grads.append(p)
+        
+        # If no parameters have gradients, skip this step (can happen when resuming)
+        if len(params_with_grads) == 0:
+            return
 
         # Kick off all the reduce scatter operations to average up the gradients across all ranks
         all_reduce_futures = []
         for group in self.param_groups:
             params = group["params"]
             zero_buffer = group["zero_buffer"]
+            # Filter out parameters without gradients
+            params_with_grads = [p for p in params if p.grad is not None]
+            if len(params_with_grads) == 0:
+                continue
             # Go through params in groups of world_size.
-            for base_i in range(0, len(params), world_size):
+            for base_i in range(0, len(params_with_grads), world_size):
                 # The compute owner of each param is rank i % world_size
                 owner_idx = base_i + rank
                 # each rank stacks up its chunk of world_size params into a list
-                rs_input = [p.grad for p in params[base_i:base_i + world_size]]
+                rs_input = [p.grad for p in params_with_grads[base_i:base_i + world_size]]
                 # pad rs_input with the zero buffer to complete the group
                 rs_input.extend([zero_buffer] * (world_size - len(rs_input)))
                 # the output buffer gets strided across the group based on the rank
-                rs_output = params[owner_idx].grad if owner_idx < len(params) else torch.empty_like(zero_buffer)
+                rs_output = params_with_grads[owner_idx].grad if owner_idx < len(params_with_grads) else torch.empty_like(zero_buffer)
                 # reduce scatter the gradients within this group of world_size params
                 work = dist.reduce_scatter(rs_output, rs_input, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 all_reduce_futures.append(work)
@@ -156,16 +168,20 @@ class DistMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             zero_buffer = group["zero_buffer"]
+            # Filter out parameters without gradients (must match the first loop)
+            params_with_grads = [p for p in params if p.grad is not None]
+            if len(params_with_grads) == 0:
+                continue
             # Go through params in groups of world_size.
-            for base_i in range(0, len(params), world_size):
+            for base_i in range(0, len(params_with_grads), world_size):
                 # The compute owner of each param is rank i % world_size
                 owner_idx = base_i + rank # calculate the index of the param that this rank owns
                 # Wait for the reduce scatter to complete
                 all_reduce_futures[future_idx].wait() # possibly later we could use wait_any polling instead
                 future_idx += 1
                 # Owner computes the Muon update, result is in its param
-                if owner_idx < len(params):
-                    p = params[owner_idx]
+                if owner_idx < len(params_with_grads):
+                    p = params_with_grads[owner_idx]
                     g = p.grad  # now averaged across ranks
                     state = self.state[p]
                     if "momentum_buffer" not in state:
@@ -177,8 +193,8 @@ class DistMuon(torch.optim.Optimizer):
                     scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
                     p.add_(g, alpha=-group["lr"] * scale)
                 # Replicate updated parameters to all ranks
-                ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
-                ag_output = params[base_i:base_i + world_size]
+                ag_input = params_with_grads[owner_idx] if owner_idx < len(params_with_grads) else zero_buffer
+                ag_output = params_with_grads[base_i:base_i + world_size]
                 ag_output.extend([torch.empty_like(zero_buffer) for _ in range(world_size - len(ag_output))]) # pad
                 work = dist.all_gather(ag_output, ag_input, async_op=True).get_future()
                 all_gather_futures.append(work)

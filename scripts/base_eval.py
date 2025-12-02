@@ -148,6 +148,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
+    parser.add_argument('--source', type=str, default='base', choices=['base', 'mid', 'sft', 'rl'], 
+                        help='Source of the model: base|mid|sft|rl (default: base)')
+    parser.add_argument('--model-tag', type=str, default=None, help='Model tag to load')
+    parser.add_argument('--step', type=int, default=None, help='Step to load')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     args = parser.parse_args()
 
@@ -166,9 +170,10 @@ def main():
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval")
-        model_name = f"base_model (step {meta['step']})" # just for logging
-        model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
+        model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+        source_name = {"base": "base", "mid": "mid-trained", "sft": "SFT", "rl": "RL"}[args.source]
+        model_name = f"{source_name}_model (step {meta['step']})" # just for logging
+        model_slug = f"{args.source}_model_{meta['step']:06d}" # for the output csv file
 
     # Evaluate the model
     with autocast_ctx:

@@ -110,7 +110,7 @@ $NPROC_PER_NODE = 1  # Change to 8 if you have 8 GPUs
 
 if ($NPROC_PER_NODE -eq 1) {
     Write-Host "Starting single-GPU pretraining..." -ForegroundColor Yellow
-    uv run -m scripts.base_train -- --depth=20 --run=$env:WANDB_RUN
+    uv run -m scripts.base_train --depth=20 --run=$env:WANDB_RUN
 } else {
     Write-Host "Starting multi-GPU pretraining ($NPROC_PER_NODE GPUs)..." -ForegroundColor Yellow
     uv run torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$env:WANDB_RUN
@@ -138,8 +138,8 @@ Invoke-WebRequest -Uri "https://karpathy-public.s3.us-west-2.amazonaws.com/ident
 
 # Run midtraining
 if ($NPROC_PER_NODE -eq 1) {
-    uv run -m scripts.mid_train -- --run=$env:WANDB_RUN
-    uv run -m scripts.chat_eval -- -i mid
+    uv run -m scripts.mid_train --run=$env:WANDB_RUN
+    uv run -m scripts.chat_eval -i mid
 } else {
     uv run torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$env:WANDB_RUN
     uv run torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
@@ -151,8 +151,8 @@ if ($NPROC_PER_NODE -eq 1) {
 Write-Host "`n[7/8] Supervised Fine-Tuning (SFT)..." -ForegroundColor Yellow
 
 if ($NPROC_PER_NODE -eq 1) {
-    uv run -m scripts.chat_sft -- --run=$env:WANDB_RUN
-    uv run -m scripts.chat_eval -- -i sft
+    uv run -m scripts.chat_sft --run=$env:WANDB_RUN
+    uv run -m scripts.chat_eval -i sft
 } else {
     uv run torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$env:WANDB_RUN
     uv run torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft

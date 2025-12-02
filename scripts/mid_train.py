@@ -127,7 +127,7 @@ val_dataset = TaskMixture([
 # these two global variables and update them from within the data generator.
 last_step = False # we will toggle this to True when we reach the end of the dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
-def mid_data_generator(split):
+def mid_data_generator(split, start_iteration=0):
     global last_step, approx_progress
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
     dataset = train_dataset if split == "train" else val_dataset
@@ -138,7 +138,7 @@ def mid_data_generator(split):
     # CUDA supports memory pinning for faster transfers between CPU and GPU:
     scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=(device_type == "cuda"))
     cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
-    it = 0 # iteration counter
+    it = start_iteration # iteration counter (accounts for resuming)
     while True:
         # Accumulate enough tokens for one iteration before yielding
         while len(token_buffer) < needed_tokens:
@@ -168,8 +168,10 @@ def mid_data_generator(split):
                 approx_progress = cursor / dataset_size # approximate progress as a fraction of the dataset
         yield inputs, targets
 
-train_loader = mid_data_generator("train")
-build_val_loader = lambda: mid_data_generator("val")
+# Initialize data generator with start_iteration to account for resuming
+# When resuming, the data generator should count from the starting step
+train_loader = mid_data_generator("train", start_iteration=start_step)
+build_val_loader = lambda: mid_data_generator("val", start_iteration=0)  # validation doesn't need to account for resume
 progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # Learning rate scheduler
@@ -187,6 +189,7 @@ def get_muon_momentum(it):
 # Checkpoint resuming logic
 start_step = 0
 min_val_bpb = float("inf")  # Initialize, will be restored from checkpoint if resuming
+saved_num_iterations = None  # Will be restored from checkpoint if resuming
 if continue_training:
     output_dirname = f"{model_type}_d{depth}"  # e.g. gpt_d12 or alcoholic_d12
     checkpoints_dir = os.path.join(base_dir, "mid_checkpoints")
@@ -212,6 +215,10 @@ if continue_training:
         # Load model weights
         orig_model.load_state_dict(model_data, strict=True, assign=True)
         
+        # Ensure model is in train mode after loading
+        orig_model.train()
+        model.train()
+        
         # Load optimizer states
         if optimizer_data is not None and len(optimizer_data) == len(optimizers):
             for opt, opt_state in zip(optimizers, optimizer_data):
@@ -220,8 +227,17 @@ if continue_training:
         else:
             print0("⚠️  Optimizer state not found or mismatched, reinitializing optimizers")
         
+        # Zero gradients after loading optimizer state to ensure clean state
+        # This is important because the optimizer state might have stale gradient references
+        orig_model.zero_grad(set_to_none=True)
+        
         # Get the saved step and adjust training
         start_step = resume_step + 1
+        
+        # Restore num_iterations from checkpoint if available (so we know the original target)
+        saved_num_iterations = meta_data.get("user_config", {}).get("num_iterations", num_iterations)
+        if saved_num_iterations is not None and saved_num_iterations > 0:
+            print0(f"📊 Original target was {saved_num_iterations} steps, remaining: {saved_num_iterations - start_step} steps")
         
         # Restore min_val_bpb from checkpoint if available
         saved_min_val_bpb = meta_data.get("min_val_bpb", None)

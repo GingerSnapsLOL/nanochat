@@ -58,7 +58,7 @@ uv run -m scripts.mid_train \
     --num_iterations=100
 # eval results will be terrible, this is just to execute the code paths.
 # note that we lower the execution memory limit to 1MB to avoid warnings on smaller systems
-uv run -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
+uv run -m scripts.chat_eval -i mid --max-new-tokens=128 --max-problems=20
 
 # SFT
 uv run -m scripts.chat_sft \

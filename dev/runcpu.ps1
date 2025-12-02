@@ -65,7 +65,7 @@ uv run -m scripts.tok_eval
 # Base training with tiny model for CPU
 Write-Host "`n[5/5] Training tiny model (this will be slow on CPU)..." -ForegroundColor Yellow
 Write-Host "Training depth=4 model with very small batch size..." -ForegroundColor Gray
-uv run -m scripts.base_train -- --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
+uv run -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
 
 Write-Host "`n========================================" -ForegroundColor Green
 Write-Host "CPU Demo Complete!" -ForegroundColor Green

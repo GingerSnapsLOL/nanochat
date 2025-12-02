@@ -35,15 +35,20 @@ for arg in sys.argv[1:]:
     else:
         # assume it's a --key=value argument
         assert arg.startswith('--')
-        key, val = arg.split('=')
+        key, val = arg.split('=', 1)  # split only on first = to handle values with =
         key = key[2:]
         if key in globals():
             try:
                 # attempt to eval it it (e.g. if bool, number, or etc)
                 attempt = literal_eval(val)
             except (SyntaxError, ValueError):
-                # if that goes wrong, just use the string
-                attempt = val
+                # if that goes wrong, check for common boolean string representations
+                val_lower = val.lower()
+                if val_lower in ('true', 'false'):
+                    attempt = val_lower == 'true'
+                else:
+                    # if that goes wrong, just use the string
+                    attempt = val
             # ensure the types match ok
             if globals()[key] is not None:
                 attempt_type = type(attempt)

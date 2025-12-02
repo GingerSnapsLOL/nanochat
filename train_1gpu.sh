@@ -162,14 +162,14 @@ fi
 # Midtraining
 echo ""
 echo -e "${BLUE}Starting midtraining...${NC}"
-uv run -m scripts.mid_train -- --run=$WANDB_RUN
-uv run -m scripts.chat_eval -- -i mid
+uv run -m scripts.mid_train --run=$WANDB_RUN
+uv run -m scripts.chat_eval -i mid
 
 # SFT
 echo ""
 echo -e "${BLUE}Starting SFT...${NC}"
-uv run -m scripts.chat_sft -- --run=$WANDB_RUN
-uv run -m scripts.chat_eval -- -i sft
+uv run -m scripts.chat_sft --run=$WANDB_RUN
+uv run -m scripts.chat_eval -i sft
 
 # Generate report
 uv run -m nanochat.report generate
