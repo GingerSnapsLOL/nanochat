@@ -167,6 +167,57 @@ def find_latest_checkpoint(checkpoints_dir, model_tag=None):
     except FileNotFoundError:
         return None, None
 
+def find_best_checkpoint(checkpoints_dir, model_tag=None, device="cpu"):
+    """
+    Find the best checkpoint (lowest validation BPB) for a given model tag.
+    Returns (checkpoint_dir, step, val_bpb) or (None, None, None) if no checkpoint found.
+    """
+    if not os.path.exists(checkpoints_dir):
+        return None, None, None
+    
+    if model_tag is None:
+        # Try to find the largest model
+        try:
+            model_tag = find_largest_model(checkpoints_dir)
+        except (FileNotFoundError, ValueError):
+            return None, None, None
+    
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
+    if not os.path.exists(checkpoint_dir):
+        return None, None, None
+    
+    # Find all checkpoint metadata files
+    meta_files = glob.glob(os.path.join(checkpoint_dir, "meta_*.json"))
+    if not meta_files:
+        return None, None, None
+    
+    best_step = None
+    best_val_bpb = float("inf")
+    
+    # Check each checkpoint's validation BPB
+    for meta_file in meta_files:
+        try:
+            step = int(os.path.basename(meta_file).split("_")[-1].split(".")[0])
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta_data = json.load(f)
+            
+            # Get validation BPB (prefer min_val_bpb, fallback to val_bpb)
+            val_bpb = meta_data.get("min_val_bpb")
+            if val_bpb is None:
+                val_bpb = meta_data.get("val_bpb")
+            
+            if val_bpb is not None and val_bpb < best_val_bpb:
+                best_val_bpb = val_bpb
+                best_step = step
+        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            log0(f"Warning: Could not read metadata from {meta_file}: {e}")
+            continue
+    
+    if best_step is not None:
+        return checkpoint_dir, best_step, best_val_bpb
+    else:
+        return None, None, None
+
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 

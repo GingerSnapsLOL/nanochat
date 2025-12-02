@@ -27,12 +27,16 @@ prompt:
 NOTE: You need OpenRouter API key in a file called "openroutertoken.txt" in the root directory of the repo.
       (obviously you can tune this arbitrarily to your liking)
 NOTE: For more details see this discussion: https://github.com/karpathy/nanochat/discussions/139
+
+Usage:
+    python -m dev.gen_synthetic_data -n 3000
 """
 import requests
 import json
 import os
 import copy
 import random
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from nanochat.common import get_base_dir
@@ -342,8 +346,14 @@ def generate_conversation(idx: int):
     return messages
 
 
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description="Generate synthetic identity conversations")
+parser.add_argument("-n", "--num_conversations", type=int, default=3000,
+                    help="Number of conversations to generate (default: 3000)")
+args = parser.parse_args()
+
 # Configuration
-num_conversations = 1000
+num_conversations = args.num_conversations
 num_workers = 4
 
 output_file = os.path.join(get_base_dir(), "identity_conversations.jsonl")
@@ -351,6 +361,7 @@ output_file = os.path.join(get_base_dir(), "identity_conversations.jsonl")
 if os.path.exists(output_file):
     os.remove(output_file)
 print(f"Saving to {output_file}")
+print(f"Generating {num_conversations} conversations...")
 
 # Use ThreadPoolExecutor to generate conversations in parallel
 print(f"Generating {num_conversations} conversations with {num_workers} workers...")

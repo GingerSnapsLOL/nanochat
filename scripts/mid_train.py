@@ -18,7 +18,7 @@ import torch
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_latest_checkpoint, find_best_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.checkpoint_manager import load_model
 import torch.distributed as dist
@@ -49,6 +49,8 @@ eval_tokens = 20*524288
 total_batch_size = 524288
 save_every = 500 # save checkpoint every N iterations (0 = disable periodic saves, only save at end)
 save_best = True # if True, save checkpoint whenever validation bpb improves
+continue_training = False # if True, resume from checkpoint (auto-detects model_tag if not set)
+continue_from_best = False # if True and continue_training=True, resume from best checkpoint instead of latest
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -182,13 +184,70 @@ def get_muon_momentum(it):
     return momentum
 
 # -----------------------------------------------------------------------------
+# Checkpoint resuming logic
+start_step = 0
+min_val_bpb = float("inf")  # Initialize, will be restored from checkpoint if resuming
+if continue_training:
+    output_dirname = f"{model_type}_d{depth}"  # e.g. gpt_d12 or alcoholic_d12
+    checkpoints_dir = os.path.join(base_dir, "mid_checkpoints")
+    
+    if continue_from_best:
+        # Find best checkpoint (lowest validation BPB)
+        checkpoint_dir, resume_step, best_val_bpb = find_best_checkpoint(checkpoints_dir, model_tag=output_dirname, device=device)
+        if checkpoint_dir is not None and resume_step is not None:
+            print0(f"🏆 Resuming from BEST checkpoint: {checkpoint_dir} at step {resume_step} (val_bpb: {best_val_bpb:.4f})")
+    else:
+        # Find latest checkpoint (highest step)
+        checkpoint_dir, resume_step = find_latest_checkpoint(checkpoints_dir, model_tag=output_dirname)
+        if checkpoint_dir is not None and resume_step is not None:
+            print0(f"🔄 Resuming from LATEST checkpoint: {checkpoint_dir} at step {resume_step}")
+    
+    if checkpoint_dir is not None and resume_step is not None:
+        # Load model state
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_step, device, load_optimizer=True)
+        
+        # Fix torch compile prefix if needed
+        model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+        
+        # Load model weights
+        orig_model.load_state_dict(model_data, strict=True, assign=True)
+        
+        # Load optimizer states
+        if optimizer_data is not None and len(optimizer_data) == len(optimizers):
+            for opt, opt_state in zip(optimizers, optimizer_data):
+                opt.load_state_dict(opt_state)
+            print0("✅ Loaded optimizer states")
+        else:
+            print0("⚠️  Optimizer state not found or mismatched, reinitializing optimizers")
+        
+        # Get the saved step and adjust training
+        start_step = resume_step + 1
+        
+        # Restore min_val_bpb from checkpoint if available
+        saved_min_val_bpb = meta_data.get("min_val_bpb", None)
+        if saved_min_val_bpb is not None:
+            min_val_bpb = saved_min_val_bpb
+            print0(f"📊 Restored min validation bpb: {min_val_bpb:.4f}")
+        else:
+            # Fallback to val_bpb if min_val_bpb not available
+            saved_val_bpb = meta_data.get("val_bpb", None)
+            if saved_val_bpb is not None:
+                min_val_bpb = saved_val_bpb
+                print0(f"📊 Restored validation bpb: {min_val_bpb:.4f}")
+        
+        print0(f"📊 Resuming from step {start_step} (checkpoint was at step {resume_step})")
+    else:
+        print0(f"⚠️  --continue specified but no checkpoint found for {output_dirname}")
+        print0("   Starting training from scratch...")
+        continue_training = False
+
+# -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
-min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = start_step
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
