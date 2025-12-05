@@ -23,14 +23,16 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_checkpoint, find_latest_checkpoint
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
 # RL hyperparameters
 run = "dummy" # wandb run name
-source = "sft" # mid|sft
+source = "sft" # mid|sft|rl , which checkpoint to load the model from. Ignored if continue_training=True
+model_tag = None # model tag to load the model from
+step = None # step to load the model from
 dtype = "bfloat16"
 device_batch_size = 8 # no forward pass will go above this to not OOM
 examples_per_step = 16 # in total and across all ranks (note: examples, not samples/completions!)
@@ -47,6 +49,10 @@ num_epochs = 1 # how many epochs of gsm8k to train on
 save_every = 60 # every how many steps to save the model
 eval_every = 60 # every how many steps to evaluate the model for val pass@k
 eval_examples = 400 # number of examples used for evaluating pass@k
+# checkpoint resuming
+continue_training = False # if True, resume from RL checkpoint (auto-detects model_tag if not set)
+continue_from_best = False # if True and continue_training=True, resume from best checkpoint instead of latest
+dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -54,17 +60,81 @@ user_config = {k: globals()[k] for k in config_keys} # will be useful for loggin
 # -----------------------------------------------------------------------------
 
 # Init compute/precision
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
+device_type = autodetect_device_type()
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-dtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
+ptdtype = torch.float32 if dtype == 'float32' else torch.bfloat16
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else torch.no_grad()
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=run, config=user_config)
 
+# -----------------------------------------------------------------------------
+# Checkpoint resuming logic (runs before model loading if continuing)
+start_step = 0
+resume_from_rl = False
+resume_checkpoint_dir = None
+resume_step = None
+output_dirname = None
+if continue_training:
+    # When continuing, we load from RL checkpoints, not from source
+    checkpoints_dir = os.path.join(get_base_dir(), "chatrl_checkpoints")
+    
+    # Determine output_dirname (model tag for RL checkpoints)
+    # If model_tag is provided, use it; otherwise try to auto-detect
+    output_dirname = model_tag
+    if output_dirname is None:
+        # Try to find the largest model in RL checkpoints
+        try:
+            from nanochat.checkpoint_manager import find_largest_model
+            output_dirname = find_largest_model(checkpoints_dir)
+            print0(f"Auto-detected model_tag: {output_dirname}")
+        except (FileNotFoundError, ValueError):
+            print0("⚠️  Could not auto-detect model_tag from RL checkpoints")
+            print0("   Please specify --model_tag explicitly")
+            continue_training = False
+    
+    if continue_training and output_dirname is not None:
+        if continue_from_best:
+            # For RL, we don't have a "best" metric, so just use latest
+            resume_checkpoint_dir, resume_step = find_latest_checkpoint(checkpoints_dir, model_tag=output_dirname)
+            if resume_checkpoint_dir is not None and resume_step is not None:
+                print0(f"🔄 Resuming from LATEST checkpoint: {resume_checkpoint_dir} at step {resume_step}")
+        else:
+            # Find latest checkpoint (highest step)
+            resume_checkpoint_dir, resume_step = find_latest_checkpoint(checkpoints_dir, model_tag=output_dirname)
+            if resume_checkpoint_dir is not None and resume_step is not None:
+                print0(f"🔄 Resuming from LATEST checkpoint: {resume_checkpoint_dir} at step {resume_step}")
+        
+        if resume_checkpoint_dir is not None and resume_step is not None:
+            resume_from_rl = True
+            # We'll load the model from the checkpoint below
+        else:
+            print0(f"⚠️  --continue specified but no checkpoint found for {output_dirname}")
+            print0("   Starting training from scratch...")
+            continue_training = False
+            resume_from_rl = False
+
 # Init model and tokenizer
-model, tokenizer, meta = load_model(source, device, phase="eval")
+if resume_from_rl:
+    # Load from RL checkpoint
+    model, tokenizer, meta = load_model("rl", device, phase="train", model_tag=output_dirname, step=resume_step)
+else:
+    # Load from source (sft/mid) or from RL if source="rl"
+    model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
+
+# Get model_type from metadata or infer from config
+model_type = meta.get("model_type", None)
+if model_type is None:
+    # Infer from config: alcoholic has extra fields
+    if hasattr(model.config, "rope_theta") or hasattr(model.config, "intermediate_size"):
+        model_type = "alcoholic"
+    else:
+        model_type = "gpt"
+print0(f"Model type: {model_type}")
+depth = model.config.n_layer
+
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -74,6 +144,18 @@ train_task = GSM8K(subset="main", split="train")
 val_task = GSM8K(subset="main", split="test")
 num_steps = (len(train_task) // examples_per_step) * num_epochs
 print0(f"Calculated number of steps: {num_steps}")
+
+# Adjust num_steps if resuming
+if resume_from_rl:
+    start_step = resume_step + 1
+    remaining_steps = num_steps - start_step
+    if remaining_steps > 0:
+        print0(f"📊 Resuming from step {start_step}, remaining steps: {remaining_steps}")
+    else:
+        print0(f"⚠️  Checkpoint is at step {resume_step}, but target is only {num_steps} steps")
+        print0("   Training will complete immediately. Consider increasing num_epochs.")
+else:
+    start_step = 0
 
 @torch.no_grad()
 def get_batch():
@@ -201,6 +283,34 @@ for opt in optimizers:
         group["lr"] = group["lr"] * init_lr_frac
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
+# -----------------------------------------------------------------------------
+# Load optimizer states if resuming
+if resume_from_rl:
+    # Load optimizer states from checkpoint
+    model_data, optimizer_data, meta_data = load_checkpoint(resume_checkpoint_dir, resume_step, device, load_optimizer=True)
+    
+    # Fix torch compile prefix if needed
+    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    
+    # Load model weights (ensure consistency)
+    model.load_state_dict(model_data, strict=True, assign=True)
+    
+    # Ensure model is in train mode after loading
+    model.train()
+    
+    # Load optimizer states
+    if optimizer_data is not None and len(optimizer_data) == len(optimizers):
+        for opt, opt_state in zip(optimizers, optimizer_data):
+            opt.load_state_dict(opt_state)
+        print0("✅ Loaded optimizer states")
+    else:
+        print0("⚠️  Optimizer state not found or mismatched, reinitializing optimizers")
+    
+    # Zero gradients after loading optimizer state to ensure clean state
+    model.zero_grad(set_to_none=True)
+    
+    print0(f"📊 Resuming from step {start_step} (checkpoint was at step {resume_step})")
+
 # Learning rate scheduler: simple rampdown to zero over num_steps
 def get_lr_multiplier(it):
     lrm = 1.0 - it / num_steps
@@ -214,7 +324,16 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
-for step in range(num_steps):
+# Skip forward in the iterator if resuming (approximate, since it's an infinite loop)
+# Note: This is a best-effort approach. For exact resuming, we'd need to track dataset position.
+for _ in range(start_step):
+    try:
+        next(batch_iterator)
+    except StopIteration:
+        batch_iterator = get_batch()
+        break
+
+for step in range(start_step, num_steps):
 
     # Evaluate the model once in a while and log to wandb
     if step % eval_every == 0:
@@ -304,22 +423,25 @@ for step in range(num_steps):
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
-    if master_process and ((step > 0 and step % save_every == 0) or step == num_steps - 1):
+    if master_process and not dry_run and ((step > 0 and step % save_every == 0) or step == num_steps - 1):
         base_dir = get_base_dir()
         depth = model.config.n_layer
-        model_tag = f"d{depth}" # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", model_tag)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        model_tag_save = f"{model_type}_d{depth}" # base the model tag on model type and depth
+        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", model_tag_save)
+        model_config_kwargs = model.config.__dict__ # works for both GPTConfig and AlcoholicNanoConfig
         save_checkpoint(
             checkpoint_dir,
             step,
             model.state_dict(),
-            None, # note: we don't bother to save the optimizer state
+            [opt.state_dict() for opt in optimizers], # Save optimizer states for resuming
             {
+                "step": step,
+                "model_type": model_type, # save which model type was used
                 "model_config": model_config_kwargs,
+                "user_config": user_config, # inputs to the training script
             }
         )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        print0(f"✅ Saved checkpoint at step {step:05d} to {checkpoint_dir}")
 
 # Log to report
 from nanochat.report import get_report

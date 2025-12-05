@@ -68,19 +68,28 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self):
+        # Filter parameters that have gradients (skip None gradients, which can happen when resuming)
+        params_with_grads = []
         for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            for p in params:
-                g = p.grad
-                assert g is not None
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf: Tensor = state["momentum_buffer"]
-                buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+            for p in group["params"]:
+                if p.grad is not None:
+                    params_with_grads.append((p, group))
+        
+        # If no parameters have gradients, skip this step (can happen when resuming)
+        if len(params_with_grads) == 0:
+            return
+        
+        # Process only parameters with gradients
+        for p, group in params_with_grads:
+            g = p.grad
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros_like(g)
+            buf: Tensor = state["momentum_buffer"]
+            buf.lerp_(g, 1 - group["momentum"])
+            g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+            g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+            p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
 
 
 class DistMuon(torch.optim.Optimizer):
