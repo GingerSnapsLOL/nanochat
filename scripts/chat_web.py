@@ -33,6 +33,7 @@ Abuse Prevention:
 import argparse
 import json
 import os
+import glob
 import torch
 import asyncio
 import logging
@@ -125,6 +126,8 @@ class WorkerPool:
             "rl": "chatrl_checkpoints",
         }
         
+        # Check available checkpoints before loading
+        available_steps = None
         if source in checkpoint_dirs:
             base_dir = get_base_dir()
             checkpoints_dir = os.path.join(base_dir, checkpoint_dirs[source])
@@ -133,6 +136,32 @@ class WorkerPool:
                             if os.path.isdir(os.path.join(checkpoints_dir, f))]
                 if model_tags:
                     print(f"Available model tags in {source}: {', '.join(sorted(model_tags))}")
+                    
+                    # If model_tag is specified or we can determine it, check available steps
+                    target_tag = model_tag if model_tag else (model_tags[0] if model_tags else None)
+                    if target_tag and step:
+                        # Check if the requested step exists
+                        model_dir = os.path.join(checkpoints_dir, target_tag)
+                        if os.path.exists(model_dir):
+                            checkpoint_files = glob.glob(os.path.join(model_dir, "model_*.pt"))
+                            available_steps = []
+                            for f in checkpoint_files:
+                                try:
+                                    s = int(os.path.basename(f).split("_")[-1].split(".")[0])
+                                    available_steps.append(s)
+                                except (ValueError, IndexError):
+                                    continue
+                            available_steps.sort()
+                            
+                            if step not in available_steps:
+                                print(f"⚠️  Requested step {step} not found!")
+                                print(f"   Available steps: {', '.join(f'{s:06d}' for s in available_steps)}")
+                                if available_steps:
+                                    latest = available_steps[-1]
+                                    print(f"   Using latest available step: {latest:06d}")
+                                    step = latest  # Fall back to latest
+                                else:
+                                    raise FileNotFoundError(f"No checkpoints found for {target_tag}")
                 else:
                     print(f"⚠️  No model tags found in {checkpoints_dir}")
             else:
@@ -144,7 +173,7 @@ class WorkerPool:
         else:
             print("Model tag not specified, will auto-detect")
         if step:
-            print(f"Loading checkpoint at step: {step}")
+            print(f"Loading checkpoint at step: {step:06d}")
         else:
             print("Loading latest checkpoint (step not specified)")
         
@@ -164,7 +193,9 @@ class WorkerPool:
                 model, tokenizer, meta = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
             except (FileNotFoundError, ValueError) as e:
                 print(f"❌ Failed to load model: {e}")
-                print(f"\n💡 Tip: Run 'python -m scripts.list_checkpoints --source={source}' to see available checkpoints")
+                if available_steps:
+                    print(f"\n💡 Available steps: {', '.join(f'{s:06d}' for s in available_steps)}")
+                print(f"\n💡 Tip: Run 'python -m scripts.list_checkpoints --source={source}' to see all available checkpoints")
                 raise
             
             # Print model info

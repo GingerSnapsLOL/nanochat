@@ -15,21 +15,36 @@ from nanochat.adamw import DistAdamW, AdamW
 
 @dataclass
 class AlcoholicNanoConfig:
-    sequence_len: int = 2048         
+    sequence_len: int = 2048
     vocab_size: int = 50000
-    n_layer: int = 30                 # num_hidden_layers
-    n_head: int = 16                  # num_attention_heads
-    n_kv_head: int = 8                # num_key_value_heads
-    n_embd: int = 1536                # hidden_size
 
-    # extra Alcoholic knobs
+    # core size
+    n_layer: int = 30          # careful: huge for 16GB, see below
+    n_embd: int = 1536
+    n_head: int = 12           # head_dim = 1536 / 12 = 128
+    n_kv_head: int = 4         # GQA ratio = 3
+    head_dim: int = None       # computed from n_embd // n_head if None (for backward compatibility)
+
+    # rotary / attention tricks
     rope_theta: float = 1_000_000.0
     qk_norm: bool = True
-    norm_type: str = "rmsnorm"       
-    mlp_type: str = "swiglu"         
-    intermediate_size: int = 6144
-    dropout: float = 0.0              
 
+    # norms & MLP
+    norm_type: str = "rmsnorm"
+    mlp_type: str = "swiglu"
+    ffn_mult: float = 3.5      # use this instead of fixed intermediate_size
+    intermediate_size: int = None  # computed from ffn_mult if None
+
+    # regularization & scaling
+    attn_dropout: float = 0.0
+    resid_dropout: float = 0.1
+    mlp_dropout: float = 0.0
+    resid_scale: float = 1.0
+    
+    def __post_init__(self):
+        """Compute head_dim if not provided (for backward compatibility with old checkpoints)."""
+        if self.head_dim is None:
+            self.head_dim = self.n_embd // self.n_head 
 
 class AlcoholicRMSNorm(nn.Module):
     def __init__(self, d, eps=1e-5):
@@ -48,23 +63,31 @@ class AlcoholicMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         d = config.n_embd
-        h = config.intermediate_size
+        if config.intermediate_size is None:
+            h = int(config.ffn_mult * d)
+        else:
+            h = config.intermediate_size
         if config.mlp_type == "swiglu":
             self.w12 = nn.Linear(d, 2 * h, bias=False)
             self.out = nn.Linear(h, d, bias=False)
             self.use_swiglu = True
+            self.mlp_dropout = nn.Dropout(config.mlp_dropout)
         else:
             self.up = nn.Linear(d, h, bias=False)
             self.act = nn.GELU()
             self.down = nn.Linear(h, d, bias=False)
             self.use_swiglu = False
+            self.mlp_dropout = nn.Dropout(config.mlp_dropout)
+        
+        # For backward compatibility with old checkpoints that use self.dropout
+        self.dropout = self.mlp_dropout
 
     def forward(self, x):
         if self.use_swiglu:
             a, b = self.w12(x).chunk(2, dim=-1)
-            return self.out(F.silu(a) * b)
+            return self.dropout(self.out(F.silu(a) * b))
         else:
-            return self.down(self.act(self.up(x)))
+            return self.dropout(self.down(self.act(self.up(x))))
 
 
 class AlcoholicCausalSelfAttention(nn.Module):
@@ -74,7 +97,8 @@ class AlcoholicCausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        # head_dim is computed in config.__post_init__ if not provided (for backward compatibility)
+        self.head_dim = config.head_dim
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
@@ -85,6 +109,8 @@ class AlcoholicCausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.resid_dropout = nn.Dropout(config.resid_dropout)
+        self.attn_dropout = nn.Dropout(config.attn_dropout)
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -149,6 +175,7 @@ class AlcoholicCausalSelfAttention(nn.Module):
         # back to [B,T,C]
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
+        y = self.resid_dropout(y)
         return y
 
 
@@ -162,10 +189,11 @@ class AlcoholicBlock(nn.Module):
         self.mlp = AlcoholicMLP(config)
         self.norm1 = AlcoholicRMSNorm(config.n_embd)
         self.norm2 = AlcoholicRMSNorm(config.n_embd)
-
+        self.resid_scale = config.resid_scale or (1.0 / (2 * config.n_layer) ** 0.5)
+        
     def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(self.norm1(x), cos_sin, kv_cache)
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.attn(self.norm1(x), cos_sin, kv_cache) * self.resid_scale
+        x = x + self.mlp(self.norm2(x)) * self.resid_scale
         return x
 
 

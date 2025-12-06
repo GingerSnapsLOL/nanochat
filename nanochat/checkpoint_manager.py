@@ -74,7 +74,7 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
-    model_config_kwargs = meta_data["model_config"]
+    model_config_kwargs = meta_data["model_config"].copy()  # Make a copy to avoid modifying original
     
     # Detect model type from metadata (saved in base_train.py) or infer from config
     model_type = meta_data.get("model_type", None)
@@ -84,6 +84,16 @@ def build_model(checkpoint_dir, step, device, phase):
             model_type = "alcoholic"
         else:
             model_type = "gpt"
+    
+    # Filter out unsupported config parameters and add computed fields for backward compatibility
+    if model_type == "alcoholic":
+        # AlcoholicNanoConfig doesn't have 'dropout', it has attn_dropout, resid_dropout, mlp_dropout
+        if "dropout" in model_config_kwargs:
+            del model_config_kwargs["dropout"]
+        # Compute head_dim from n_embd // n_head if not present (for old checkpoints)
+        if "head_dim" not in model_config_kwargs:
+            if "n_embd" in model_config_kwargs and "n_head" in model_config_kwargs:
+                model_config_kwargs["head_dim"] = model_config_kwargs["n_embd"] // model_config_kwargs["n_head"]
     
     log0(f"Building {model_type} model with config: {model_config_kwargs}")
     
