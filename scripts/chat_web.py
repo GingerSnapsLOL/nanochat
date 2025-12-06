@@ -62,14 +62,14 @@ MAX_MAX_TOKENS = 4096
 
 parser = argparse.ArgumentParser(description='NanoChat Web Server')
 parser.add_argument('-n', '--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
-parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|mid|rl")
+parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: base|mid|sft|rl (default: sft)")
 parser.add_argument('-t', '--temperature', type=float, default=0.8, help='Default temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Default top-k sampling parameter')
 parser.add_argument('-m', '--max-tokens', type=int, default=512, help='Default max tokens for generation')
-parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load')
-parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
+parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag to load (e.g., alcoholic_d12, d20). Auto-detected if not provided.')
+parser.add_argument('-s', '--step', type=int, default=None, help='Step to load (default: latest checkpoint)')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
-parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
+parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'], help='Data type for model (default: bfloat16)')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
 args = parser.parse_args()
@@ -111,6 +111,43 @@ class WorkerPool:
     async def initialize(self, source: str, model_tag: Optional[str] = None, step: Optional[int] = None):
         """Load model on each GPU."""
         print(f"Initializing worker pool with {self.num_gpus} GPUs...")
+        print(f"Loading model from source: {source}")
+        
+        # Check if checkpoint directory exists and list available models
+        from nanochat.checkpoint_manager import load_model
+        from nanochat.common import get_base_dir
+        import os
+        
+        checkpoint_dirs = {
+            "base": "base_checkpoints",
+            "mid": "mid_checkpoints",
+            "sft": "chatsft_checkpoints",
+            "rl": "chatrl_checkpoints",
+        }
+        
+        if source in checkpoint_dirs:
+            base_dir = get_base_dir()
+            checkpoints_dir = os.path.join(base_dir, checkpoint_dirs[source])
+            if os.path.exists(checkpoints_dir):
+                model_tags = [f for f in os.listdir(checkpoints_dir) 
+                            if os.path.isdir(os.path.join(checkpoints_dir, f))]
+                if model_tags:
+                    print(f"Available model tags in {source}: {', '.join(sorted(model_tags))}")
+                else:
+                    print(f"⚠️  No model tags found in {checkpoints_dir}")
+            else:
+                print(f"⚠️  Checkpoint directory does not exist: {checkpoints_dir}")
+                print(f"   Run 'python -m scripts.list_checkpoints --source={source}' to see available checkpoints")
+        
+        if model_tag:
+            print(f"Using model tag: {model_tag}")
+        else:
+            print("Model tag not specified, will auto-detect")
+        if step:
+            print(f"Loading checkpoint at step: {step}")
+        else:
+            print("Loading latest checkpoint (step not specified)")
+        
         if self.num_gpus > 1:
             assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
 
@@ -123,7 +160,23 @@ class WorkerPool:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            try:
+                model, tokenizer, meta = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            except (FileNotFoundError, ValueError) as e:
+                print(f"❌ Failed to load model: {e}")
+                print(f"\n💡 Tip: Run 'python -m scripts.list_checkpoints --source={source}' to see available checkpoints")
+                raise
+            
+            # Print model info
+            detected_model_type = meta.get("model_type", None)
+            if detected_model_type is None:
+                # Infer from config
+                if hasattr(model.config, "rope_theta") or hasattr(model.config, "intermediate_size"):
+                    detected_model_type = "alcoholic"
+                else:
+                    detected_model_type = "gpt"
+            print(f"  ✓ Loaded {detected_model_type} model (depth={model.config.n_layer}, vocab_size={model.config.vocab_size})")
+            
             engine = Engine(model, tokenizer)
             autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
@@ -411,5 +464,11 @@ async def stats():
 if __name__ == "__main__":
     import uvicorn
     print(f"Starting NanoChat Web Server")
-    print(f"Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
+    print(f"Configuration:")
+    print(f"  Source: {args.source}")
+    print(f"  Model tag: {args.model_tag or '(auto-detect)'}")
+    print(f"  Step: {args.step or '(latest)'}")
+    print(f"  Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
+    print(f"  Dtype: {args.dtype}")
+    print(f"  Port: {args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
